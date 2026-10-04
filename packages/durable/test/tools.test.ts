@@ -169,14 +169,14 @@ const TRUNCATED_OUTPUT_LINES = DEFAULT_MAX_LINES + 1;
 
 class TimeoutOutputExecutionEnv extends NodeExecutionEnv {
 	override async exec(
-		_command: string,
+		_command: string | readonly string[],
 		options: ShellExecOptions | undefined,
 		context: Context,
 	): Promise<Result<ShellExecResult, ExecutionError>> {
 		const output = `${Array.from({ length: TRUNCATED_OUTPUT_LINES }, (_, index) => `line-${index + 1}`).join("\n")}\n`;
 		const spillPath = getOrThrow(await this.createTempFile({ prefix: "timeout-", suffix: ".log" }, context));
 		getOrThrow(await this.writeFile(spillPath, output, context));
-		options?.onOutput?.(output, context);
+		options?.onOutput?.(output, context, { stream: "stdout" });
 		const error = new ExecutionError("timeout", `timeout:${options?.timeout}`);
 		error.spillPath = spillPath;
 		return err(error);
@@ -568,15 +568,20 @@ describe("durable tools", () => {
 					execution.cwd = workspace;
 					execution.env = { PI_BASH_PREPARE_EXPLICIT: "explicit" };
 					execution.inheritEnv = false;
-					execution.command += `\nprintf '%s:%s:%s:%s' "$prefix" "\${PI_BASH_PREPARE_INHERITED-}" "$PI_BASH_PREPARE_EXPLICIT" "$PWD"`;
+					execution.command += `\n: > prepared-cwd\nprintf '%s:%s:%s' "$prefix" "\${PI_BASH_PREPARE_INHERITED-}" "$PI_BASH_PREPARE_EXPLICIT"`;
+					// Git Bash on Windows reports $PWD as an MSYS path, so only POSIX compares it.
+					if (process.platform !== "win32") execution.command += `\nprintf ':%s' "$PWD"`;
 				},
 			});
 			const result = await run(tool, { command: ":" }, env, withAbortSignal(controller.signal, BACKGROUND_CONTEXT));
 			expect(receivedEnv).toBe(env);
 			expect(receivedSignal).toBe(controller.signal);
-			expect(result.output.join("")).toBe(
-				`ready::explicit:${getOrThrow(await env.canonicalPath(workspace, BACKGROUND_CONTEXT))}`,
-			);
+			const pwd =
+				process.platform === "win32"
+					? ""
+					: `:${getOrThrow(await env.canonicalPath(workspace, BACKGROUND_CONTEXT))}`;
+			expect(result.output.join("")).toBe(`ready::explicit${pwd}`);
+			expect(getOrThrow(await env.exists(`${workspace}/prepared-cwd`, BACKGROUND_CONTEXT))).toBe(true);
 		});
 
 		it("supports command prefixes", async () => {
