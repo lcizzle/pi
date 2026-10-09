@@ -16,8 +16,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
 
       - name: Sync with Upstream
-        run: gh repo sync ${{ github.repository }} --branch main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          UPSTREAM_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name')
+          if [ -n "$UPSTREAM_REPO" ] && [ "$UPSTREAM_REPO" != "null" ]; then
+            git checkout -B main
+            git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+            git fetch upstream main
+            git merge upstream/main -m "Merge upstream main into main"
+            git push origin main
+          else
+            echo "No upstream parent repository found."
+            exit 1
+          fi
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
