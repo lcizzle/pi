@@ -30,7 +30,19 @@ jobs:
             git checkout -B main
             git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
             git fetch upstream main
-            git merge upstream/main -m "Merge upstream main into main"
+            if ! git merge upstream/main -m "Merge upstream main into main"; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              if [ "$CONFLICTS" = "nix/model-catalog.json" ]; then
+                echo "Conflict detected only in nix/model-catalog.json. Resolving using upstream version."
+                git checkout --theirs nix/model-catalog.json
+                git add nix/model-catalog.json
+                git commit -m "Merge upstream main into main (auto-resolved nix/model-catalog.json)"
+              else
+                echo "Merge conflicts found in files other than nix/model-catalog.json:"
+                echo "$CONFLICTS"
+                exit 1
+              fi
+            fi
             git push origin main
           else
             echo "No upstream parent repository found."
