@@ -2251,7 +2251,8 @@ wait in the built-in inbox document, an ordered list of tagged items:
 
 ```ts
 type InboxItem =
-  | { readonly id: SubmissionId; readonly mode: "steer" | "followUp"; readonly content: UserInput }
+  /** `entry` is the input's `InputEntry` (`kind` and optional `data`), present when given. */
+  | { readonly id: SubmissionId; readonly mode: "steer" | "followUp"; readonly content: UserInput; readonly entry?: InputEntry }
   /** `entry` is the write's `EntryDraft`, stored as plain JSON. */
   | { readonly id: SubmissionId; readonly mode: "write"; readonly entry: JsonObject };
 
@@ -2268,8 +2269,24 @@ type InboxState = { items: InboxItem[] };
 | view mount | `docs["pi.inbox"]` |
 | created | with every Harness conversation (section 2.2) |
 
-Items are in ID order. A queued input stores its content; its `pi.user` entry
-gets the Harness clock's timestamp at placement. Queued submissions belong to
+Items are in ID order. A queued input stores its content and its entry's kind
+and data; its entry gets the Harness clock's timestamp at placement.
+
+An input is placed as one entry whose `model` is the user message of its
+`content`: a `pi.user` entry, or, with `entry: { kind, data }`, an entry of that
+kind carrying that data. Only `kind` and `data` are taken from `entry`; admission
+rejects a kind that is not a non-empty string or starts with `pi.`. Nothing in
+the Harness reads input entries by kind; context, compaction, events, and run
+accounting go by `model` and the submission records.
+
+A write of only `kind` and `data`, with no `model`, `head`, or `edits` (present
+counts, even if empty), is display-only: it changes no model context, so admission
+appends it and settles it `done` in the same commit, busy or idle, ahead of
+earlier submissions still queued. Between a tool call and its result it changes
+nothing, because results are ordered by message. The one exception is a queued
+reset: appended before it, the entry would fall out of the context the reset
+starts, so a display-only write queues behind a queued reset and is placed after
+it at the same boundary. Queued submissions belong to
 their conversation, so a fork starts with an empty inbox.
 
 Run control lives in the built-in live document `pi.live` (section 8). Its
@@ -2288,8 +2305,9 @@ Admission and terminal transitions:
 | action | submission state | other writes |
 |---|---|---|
 | input, idle with empty inbox | `placed`, with user entry | create run and generation |
+| display-only write, no queued reset | `done`, with entry | append entry; no run |
 | write, idle with empty inbox | `done`, with entry | append entry; no run |
-| input or write, busy or non-empty inbox | `queued` | append inbox item |
+| input or other write, busy or non-empty inbox | `queued` | append inbox item |
 | boundary places user item | `placed`, with entry | add ID to current or successor run |
 | boundary places write | `done`, with entry | append entry |
 | run answers | input `done`, with required answer entry | remove `run`, or hand it to a successor |
@@ -2303,8 +2321,9 @@ writes no record and reports `ConversationBusy`. An idle input queues with mode
 `steer` when `whenBusy` is `steer` and `followUp` otherwise.
 
 An idle conversation with a non-empty inbox, for example after a failed run,
-queues every new submission behind the waiting items and runs a final boundary
-in the same commit. Order is preserved: a follow-up queued before the failure is
+queues every new input and every write that is not display-only behind the
+waiting items and runs a final boundary in the same commit. A display-only write
+is appended without one, so a chat message never restarts failed work. Order is preserved: a follow-up queued before the failure is
 selected before the new input.
 
 A `Submission` waits until `done` or `unanswered`; abort withdraws only a still-
@@ -2366,7 +2385,7 @@ Only successful run ends apply the final boundary: an answer, `terminate`, or
 `handoff`. Failure, a run task's abort handler, fault, and orphan settle the
 run's inputs `unanswered` and leave the inbox alone (`Conversation.abort()`
 separately withdraws queued user items); the queued items stay visible in
-`pi.inbox` until the next submission's boundary or their withdrawal.
+`pi.inbox` until the next input or queued write runs a boundary, or their withdrawal.
 
 Selected and stale items are removed positionally while retained item order is
 preserved. Chord's Astra operation generator must express scattered removals
@@ -3404,9 +3423,12 @@ Generation preparation takes these steps against its phase snapshot:
    append one positional `pi.system` entry when they differ.
 
 Preparation does not recheck the transcript before appending: only the Harness
-writes to a busy conversation, through submissions, run tasks, boundaries, and a
-blocking compaction, which appends only while its generation waits for it
-(section 8.7), so the transcript it read is still current (section 12).
+writes model context to a busy conversation, through submissions, run tasks,
+boundaries, and a blocking compaction, which appends only while its generation
+waits for it (section 8.7), so the context it read is still current (section 12).
+Display-only writes (section 6) may land meanwhile; they contribute no messages,
+and the system entry planning, the compaction threshold, and the request cutoff
+depend only on contributions and the newest entry ID.
 
 Model and thinking level are request options, not prompt state.
 
@@ -3638,6 +3660,18 @@ type LiveState = {
   }[];
   /** Live compaction tasks in task ID order; absent when none (section 8.7). */
   compactions?: CompactionStatus[];
+  /**
+   * The newest compaction failure since a compaction last produced a summary (section 8.7), so a client can show it
+   * after the task ended.
+   */
+  compactionFailure?: CompactionFailure;
+};
+
+type CompactionFailure = {
+  taskId: TaskId<CompactionResult>;
+  reason: CompactionReason;
+  /** The failed or faulted outcome's error message, or why the scheduler orphaned the task. */
+  error: string;
 };
 
 type CompactionStatus = {
@@ -3716,6 +3750,8 @@ type GenerationCheckpoint =
       compacted?: TaskId<CompactionResult>;
       /** Error text of the overflow that started `compacted`; checked once when `prepare` resumes. */
       overflow?: string;
+      /** Set when the blocking threshold started `compacted`; its outcome is checked once when `prepare` resumes. */
+      threshold?: true;
     }
   | {
       phase: "request";
@@ -3773,8 +3809,15 @@ The run's inputs live in `pi.live.run`, not in the task input.
   - Above `contextWindow - reserveTokens`, the blocking threshold: instead of
     appending, one commit creates a compaction owned by the generation with reason
     `threshold`, adds its status, and commits `waiting` on it with `allSettled`
-    and checkpoint `{ phase: "prepare", attempt, compacted }`. Whatever its
-    outcome, `prepare` then runs again and sends the request.
+    and checkpoint `{ phase: "prepare", attempt, compacted, threshold: true }`.
+    When `prepare` resumes, it reads the compaction's outcome once. If the
+    compaction completed, with or without a summary (nothing to compact, or
+    declined), `prepare` continues and sends the request. If it failed,
+    faulted, was orphaned, or was aborted directly, the generation fails with
+    `model_error` without a request, and its inputs settle `unanswered` with
+    detail `Compaction failed: <error>` (`Compaction was aborted` for an
+    abort). A failed compaction leaves a context above the blocking threshold,
+    where a request would at best leave no room for the answer.
   - Above `contextWindow - reserveTokens - backgroundTokens` with
     `backgroundTokens > 0` and no compaction status in `pi.live`: the commit that
     moves to `request` also creates a background compaction, owned by the
@@ -4082,9 +4125,11 @@ Phases:
   captured tail, and the cut as `firstKept`.
 - `summarize` derives the summarized messages again from the context at `tail`,
   which is immutable, and serializes them to text: `[User]: ...`,
-  `[Assistant thinking]: ...`, `[Assistant]: ...`,
-  `[Assistant tool calls]: name(key=json, ...)`, and `[Tool result]: ...`
-  truncated to 2000 characters; system messages are omitted. The request has no
+  `[Assistant]: ...`, `[Assistant tool calls]: name(key=json, ...)`, and
+  `[Tool result]: ...` truncated to 2000 characters; system messages and
+  thinking are omitted (replayed thinking is often not part of the live
+  context, so it could make the request larger than the context it
+  summarizes). The request has no
   tools and two messages: a system message with the built-in summarization
   system prompt, and a user message with the serialized text in
   `<conversation>` tags followed by the built-in summarization prompt, and
@@ -4122,8 +4167,8 @@ the conversation.
 
 where `wrapped` is `"The conversation history before this point was compacted
 into the following summary:\n\n<summary>\n"`, the summary, and
-`"\n</summary>"`. The commit that places it also removes the task's status and
-commits the task's `completed` outcome:
+`"\n</summary>"`. The commit that places it also removes the task's status,
+removes `pi.live.compactionFailure`, and commits the task's `completed` outcome:
 
 - A blocking compaction appends the entry directly and completes with
   `{ entryId }`. Its generation holds the run and waits, so nothing else writes
@@ -4149,10 +4194,18 @@ aborted with its generation, before the generation's abort handler runs
 (section 5.5). A summary that is already queued is a write submission:
 conversation abort keeps it, and `Submission.abort()` withdraws it.
 
-When a blocking compaction ends without an `entryId`, because it found nothing
-to compact, was declined, failed, faulted, or was aborted directly, a threshold
-generation sends its request anyway and an overflow generation fails with
-`model_error` (section 8.3).
+**Failure.** The commit that fails a compaction (`model_error`, `no_model`)
+removes its status and sets `pi.live.compactionFailure` to its task, reason,
+and error message, replacing an older failure; the Harness cleanup does the
+same for a compaction the scheduler faults or orphans, with the fault's
+message or the orphan reason. Only a compaction that produces a summary
+removes it; one that is aborted or finds nothing to compact leaves it.
+
+When a blocking compaction ends without an `entryId`, an overflow generation
+fails with `model_error`. A threshold generation sends its request anyway
+when the compaction completed (it found nothing to compact or was declined),
+and fails with `model_error` when it failed, faulted, was orphaned, or was
+aborted directly (section 8.3).
 
 
 ## 9. Document observation and Chord
@@ -4400,6 +4453,8 @@ type AgentEvent =
       nestedTools: readonly NestedToolSlot[];
       /** `pi.live.compactions` (section 8.2). */
       compactions: readonly CompactionStatus[];
+      /** `pi.live.compactionFailure` (section 8.2). */
+      compactionFailure?: CompactionFailure;
       inbox: readonly { id: SubmissionId; mode: InboxItem["mode"] }[];
       /** `pi.agent`; `{}` when absent. */
       agent: AgentState;
@@ -4433,7 +4488,7 @@ type AgentEvent =
   | { type: "task_failed"; taskId: TaskId; kind: string; message: string }
   | { type: "compaction_start"; taskId: TaskId; reason: CompactionReason; blocking: boolean }
   /** The task's receipt tells whether it produced a summary; the summary entry has its own events. */
-  | { type: "compaction_end"; taskId: TaskId; reason: CompactionReason };
+  | { type: "compaction_end"; taskId: TaskId; reason: CompactionReason; error?: string };
 
 /** One change to the in-flight assistant message, relative to that message. */
 type MessageChange =
@@ -4507,8 +4562,9 @@ Events derive from committed changes:
   gains or drops `retry`, or gains `deferred` or moves its `pollAt`.
 - `task_failed`: a task of the conversation settles `faulted` or `orphaned`.
 - `compaction_start`/`compaction_end`: a status appears in or disappears from
-  `pi.live.compactions`. A retry backoff shows only in the snapshot's
-  `compactions`. A queued summary is placed later with its own
+  `pi.live.compactions`. `compaction_end` carries `error` when the same commit
+  recorded the task in `pi.live.compactionFailure`. A retry backoff shows only
+  in the snapshot's `compactions`. A queued summary is placed later with its own
   `message_start`/`message_end` and `submission` events.
 
 One commit produces one batch, in this order: `tool_execution_start`,
@@ -4979,7 +5035,8 @@ These are contracts, not invitations to add defensive machinery:
   use a write submission.
 - **Queued items after a failed run:** failure and task abort leave the inbox alone.
   Queued follow-ups wait in `pi.inbox`, and their `wait()` does not settle, until
-  the next submission's boundary places them or the host withdraws them. A
+  the next input or queued write's boundary places them or the host withdraws
+  them; a display-only write runs no boundary. A
   compaction summary is such a submission: when a manual or background
   compaction finishes in that idle conversation, its final boundary places the
   waiting follow-ups and starts a run.
